@@ -85,16 +85,21 @@ function isLikelyCredentialValue(value: string): boolean {
   return true;
 }
 
-// matches member-access/call chains like "useAuthStore.getState().accessToken"
-// or "response.data.accessToken". A literal secret value is never written
-// this way, so an unquoted assignment captured by INLINE_ASSIGNMENTS' third
-// (no-quotes) pattern gets misread as a credential unless we recognize it's
-// actually a source-code expression, not a literal.
-const CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\(\))?(?:\.[A-Za-z_$][\w$]*(?:\(\))?)*$/;
+// Unquoted "values" in source code are usually expressions, not literals:
+// "useAuthStore.getState().accessToken", "authHeader.substring(7)", a bare
+// variable like "accessToken", or "string):" left over from a TS parameter list.
+// Digit-free bare identifiers are treated as variable names; real secrets and
+// passwords almost always contain a digit, so "Sup3rValue" still gets flagged.
+const CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\([^()"'`]*\))?(?:\.[A-Za-z_$][\w$]*(?:\([^()"'`]*\))?)*$/;
 
 function looksLikeCodeExpression(value: string): boolean {
-  if (!CODE_EXPRESSION.test(value)) return false;
-  return value.includes(".") || value.endsWith("()");
+  for (let v = value; v; v = v.slice(0, -1)) {
+    if (CODE_EXPRESSION.test(v)) {
+      return v.includes(".") || v.includes("(") || !/\d/.test(v);
+    }
+    if (!/[):]$/.test(v)) return false;
+  }
+  return false;
 }
 
 function inspectString(value: string, found: Set<SecretType>): void {

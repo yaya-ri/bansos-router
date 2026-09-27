@@ -210,6 +210,10 @@ test("secret guard detects required credential classes and avoids common placeho
     "password = <redacted>",
     { tools: [{ parameters: { properties: { password: { type: "string" } } } }] },
     { token: "placeholder" },
+    "const token = useAuthStore.getState().accessToken;",
+    "const token = authHeader.substring(7);",
+    "async login(email: string, password: string, secret: string): Promise<any> {",
+    "return { access_token: accessToken, refresh_token: rawRefreshToken };",
   ]) {
     assert.equal(scanRequestBody(normal).blocked, false);
   }
