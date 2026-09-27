@@ -56,10 +56,10 @@ const SENSITIVE_KEYS = new Set([
   "signingsecret",
 ]);
 
-const INLINE_ASSIGNMENTS = [
-  /\b([\w-]+)\s*[:=]\s*"([^"]+)"/gi,
-  /\b([\w-]+)\s*[:=]\s*'([^']+)'/gi,
-  /\b([\w-]+)\s*[:=]\s*([^\s,;'"}]+)/gi,
+const INLINE_ASSIGNMENTS: ReadonlyArray<{ pattern: RegExp; quoted: boolean }> = [
+  { pattern: /\b([\w-]+)\s*[:=]\s*"([^"]+)"/gi, quoted: true },
+  { pattern: /\b([\w-]+)\s*[:=]\s*'([^']+)'/gi, quoted: true },
+  { pattern: /\b([\w-]+)\s*[:=]\s*([^\s,;'"}]+)/gi, quoted: false },
 ];
 
 const PLACEHOLDER_VALUES = new Set([
@@ -85,19 +85,31 @@ function isLikelyCredentialValue(value: string): boolean {
   return true;
 }
 
+// matches member-access/call chains like "useAuthStore.getState().accessToken"
+// or "response.data.accessToken". A literal secret value is never written
+// this way, so an unquoted assignment captured by INLINE_ASSIGNMENTS' third
+// (no-quotes) pattern gets misread as a credential unless we recognize it's
+// actually a source-code expression, not a literal.
+const CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\(\))?(?:\.[A-Za-z_$][\w$]*(?:\(\))?)*$/;
+
+function looksLikeCodeExpression(value: string): boolean {
+  if (!CODE_EXPRESSION.test(value)) return false;
+  return value.includes(".") || value.endsWith("()");
+}
+
 function inspectString(value: string, found: Set<SecretType>): void {
   for (const { type, pattern } of KNOWN_SECRET_PATTERNS) {
     if (pattern.test(value)) found.add(type);
   }
 
-  for (const pattern of INLINE_ASSIGNMENTS) {
+  for (const { pattern, quoted } of INLINE_ASSIGNMENTS) {
     pattern.lastIndex = 0;
     for (let match = pattern.exec(value); match; match = pattern.exec(value)) {
       const key = match[1] ?? "";
       const assigned = match[2] ?? "";
-      if (SENSITIVE_KEYS.has(normalizeKey(key)) && isLikelyCredentialValue(assigned)) {
-        found.add("credential_assignment");
-      }
+      if (!SENSITIVE_KEYS.has(normalizeKey(key))) continue;
+      if (!quoted && looksLikeCodeExpression(assigned)) continue;
+      if (isLikelyCredentialValue(assigned)) found.add("credential_assignment");
     }
   }
 }
