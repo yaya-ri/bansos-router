@@ -189,9 +189,11 @@ test("secret guard detects required credential classes and avoids common placeho
   const anthropic = ["sk", "ant", "api03", "B".repeat(24)].join("-");
   const github = `github_pat_${"C".repeat(24)}`;
   const aws = `AKIA${"D".repeat(16)}`;
-  const privateKey = "-----BEGIN PRIVATE KEY-----";
-  const encryptedPrivateKey = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
-  const sshKey = "-----BEGIN OPENSSH PRIVATE KEY-----";
+  const pemBody = "\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n";
+  const privateKey = `-----BEGIN PRIVATE KEY-----${pemBody}`;
+  const encryptedPrivateKey = `-----BEGIN ENCRYPTED PRIVATE KEY-----${pemBody}`;
+  const sshKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n";
+  const jsonEscapedKey = JSON.stringify({ private_key: privateKey }).slice(1, -1);
 
   assert.deepEqual(scanRequestBody(openAi).secretTypes, ["openai_api_key"]);
   assert.deepEqual(scanRequestBody(anthropic).secretTypes, ["anthropic_api_key"]);
@@ -200,22 +202,53 @@ test("secret guard detects required credential classes and avoids common placeho
   assert.deepEqual(scanRequestBody(privateKey).secretTypes, ["private_key"]);
   assert.deepEqual(scanRequestBody(encryptedPrivateKey).secretTypes, ["private_key"]);
   assert.deepEqual(scanRequestBody(sshKey).secretTypes, ["ssh_private_key"]);
-  assert.equal(scanRequestBody("password = Sup3rSyntheticValue").blocked, true);
-  assert.equal(scanRequestBody('token: "Synthetic credential value"').blocked, true);
-  assert.equal(scanRequestBody('notes: "Synthetic credential value"').blocked, false);
+  assert.deepEqual(scanRequestBody(jsonEscapedKey).secretTypes, ["private_key"]);
+
+  for (const leak of [
+    "password = Sup3rSyntheticValue",
+    'token: "Synth3ticCredentialValue9"',
+    "API_KEY=a7Fq2Lx9Vb4Nc8Kd1Mz6Ws3Ry5Tu0Pe",
+    "export TOKEN=Zq8Wm2Xn4Cb6Vl1Kj9Hg3Fd5Sa7Pq0Ow",
+    "  - token: Rt5Yu7Io9Pa2Sd4Fg6Hj8Kl1Zx3Cv5Bn",
+    "const apiKey = 'k9Jd2Lq7Xw4Mv8Nb3Hs6Tz1Rc5Yf0Ga';",
+    '  "client_secret": "GOCSPX-Q3wE5rT7yU9iO1pA2sD4fG6hJ8k",',
+    "here is my token: Lp3Ks8Jd2Hf7Gq1Wm5Xn9Cb4Vz6Ra0Te",
+  ]) {
+    assert.deepEqual(scanRequestBody(leak).secretTypes, ["credential_assignment"], leak);
+  }
 
   for (const normal of [
     "Explain why passwords should never be pasted into prompts.",
     "Use process.env.API_KEY instead of a literal value.",
     "password = <redacted>",
+    'notes: "Synthetic credential value"',
     { tools: [{ parameters: { properties: { password: { type: "string" } } } }] },
     { token: "placeholder" },
+    // PEM parser constants and vendor doc samples
+    'const pemHeader = "-----BEGIN PRIVATE KEY-----";',
+    'AccessKeyId: "AKIAIOSFODNN7EXAMPLE",',
+    // auth source code: variables, calls, types, index access, generics
     "const token = useAuthStore.getState().accessToken;",
     "const token = authHeader.substring(7);",
     "async login(email: string, password: string, secret: string): Promise<any> {",
     "return { access_token: accessToken, refresh_token: rawRefreshToken };",
+    "  apiKey: parsed?.apiKey || null,",
+    "apiKey = process.env[environmentVariableName];",
+    "const apiKey = headers['x-goog-api-key'];",
+    "  apiKey: z.ZodOptional<z.ZodString>;",
+    "  token: tokenType_js_1.default.COMMA,",
+    "- bcrypt.**compare**(password: `string`, hash: `string`): `Promise<boolean>`",
+    "e.message = `Could not refresh access token: ${e.message}`;",
+    "  api_key: ${OPENAI_API_KEY}",
+    'accessToken:"cursorAuth/accessToken"',
+    // messages, fixtures and samples
+    'password: "Password must be at least 8 characters"',
+    "accessToken: 'mock-access-token-123',",
+    'refresh_token: "***REDACTED***",',
+    '"password": "SecurePassword123!"',
+    '"refresh_token": "LZhriF9bf88pPykpXCuZ9...",',
   ]) {
-    assert.equal(scanRequestBody(normal).blocked, false);
+    assert.equal(scanRequestBody(normal).blocked, false, JSON.stringify(normal));
   }
 });
 
@@ -251,7 +284,7 @@ test("strict DLP blocks OpenAI, GitHub, and SSH secrets on all wire protocols wi
   const secrets = [
     ["sk", "proj", "E".repeat(24)].join("-"),
     `github_pat_${"F".repeat(24)}`,
-    "-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic\n-----END OPENSSH PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n-----END OPENSSH PRIVATE KEY-----",
   ];
   try {
     const requests = wireRequests(model.id, "unused");
