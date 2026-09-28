@@ -62,16 +62,16 @@ const SENSITIVE_KEYS = new Set([
 
 const INLINE_ASSIGNMENTS = [
   // the optional quote after the key covers JSON: "client_secret": "..."
-  /\b([\w-]+)["']?[ \t]*[:=][ \t]*"([^"\n]+)"/gi,
-  /\b([\w-]+)["']?[ \t]*[:=][ \t]*'([^'\n]+)'/gi,
+  /\b([\w-]+)["']?[ \t]*[:=][ \t]*"([^"\n]+)"/dgi,
+  /\b([\w-]+)["']?[ \t]*[:=][ \t]*'([^'\n]+)'/dgi,
   // unquoted values only count on config-style lines (.env, YAML, INI, shell
   // export): in source code an unquoted right-hand side is always an expression
-  /^[ \t]*(?:-[ \t]+)?(?:export[ \t]+)?([\w-]+)[ \t]*[:=][ \t]*([^\s"'`]+)[ \t]*(?:#.*)?$/gim,
+  /^[ \t]*(?:-[ \t]+)?(?:export[ \t]+)?([\w-]+)[ \t]*[:=][ \t]*([^\s"'`]+)[ \t]*(?:#.*)?$/dgim,
 ];
 
 // "my token: <pasted value>" in chat: unquoted and mid-line, so only long
 // letter+digit values count there
-const PROSE_ASSIGNMENT = /\b([\w-]+)[ \t]*[:=][ \t]*([A-Za-z0-9_\-+/=.~]{16,})(?=[\s.,;)]|$)/gi;
+const PROSE_ASSIGNMENT = /\b([\w-]+)[ \t]*[:=][ \t]*([A-Za-z0-9_\-+/=.~]{16,})(?=[\s.,;)]|$)/dgi;
 
 const PLACEHOLDER_VALUES = new Set([
   "example", "sample", "test", "dummy", "placeholder", "redacted", "masked",
@@ -118,11 +118,40 @@ function isLikelyCredentialValue(value: string): boolean {
   return true;
 }
 
-function inspectString(value: string, found: Set<SecretType>): void {
-  for (const { type, pattern } of KNOWN_SECRET_PATTERNS) {
-    // vendor doc samples such as AKIAIOSFODNN7EXAMPLE
-    const match = pattern.exec(value);
-    if (match && !isPlaceholderValue(match[0])) found.add(type);
+interface SecretSpan {
+  start: number;
+  end: number;
+  type: SecretType;
+}
+
+const GLOBAL_SECRET_PATTERNS = KNOWN_SECRET_PATTERNS.map(({ type, pattern }) => ({
+  type,
+  pattern: new RegExp(pattern.source, "g"),
+}));
+
+// a PEM match only covers the header and first body chunk; redaction has to
+// swallow the rest of the base64 body too, up to the END line when present
+function pemSpanEnd(value: string, matchEnd: number): number {
+  const endMarker = /-----END [A-Z0-9 ]+-----/g;
+  endMarker.lastIndex = matchEnd;
+  const end = endMarker.exec(value);
+  if (end) return end.index + end[0].length;
+  const rest = /^(?:\s|\\[rn]|[A-Za-z0-9+/=])*/.exec(value.slice(matchEnd));
+  return matchEnd + (rest?.[0].length ?? 0);
+}
+
+function findSecretSpans(value: string): SecretSpan[] {
+  const spans: SecretSpan[] = [];
+
+  for (const { type, pattern } of GLOBAL_SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(value); match; match = pattern.exec(value)) {
+      // vendor doc samples such as AKIAIOSFODNN7EXAMPLE
+      if (isPlaceholderValue(match[0])) continue;
+      const matchEnd = match.index + match[0].length;
+      const end = type === "private_key" || type === "ssh_private_key" ? pemSpanEnd(value, matchEnd) : matchEnd;
+      spans.push({ start: match.index, end, type });
+    }
   }
 
   for (const pattern of INLINE_ASSIGNMENTS) {
@@ -130,8 +159,9 @@ function inspectString(value: string, found: Set<SecretType>): void {
     for (let match = pattern.exec(value); match; match = pattern.exec(value)) {
       const key = match[1] ?? "";
       const assigned = match[2] ?? "";
-      if (SENSITIVE_KEYS.has(normalizeKey(key)) && isLikelyCredentialValue(assigned)) {
-        found.add("credential_assignment");
+      const range = match.indices?.[2];
+      if (range && SENSITIVE_KEYS.has(normalizeKey(key)) && isLikelyCredentialValue(assigned)) {
+        spans.push({ start: range[0], end: range[1], type: "credential_assignment" });
       }
     }
   }
@@ -139,19 +169,41 @@ function inspectString(value: string, found: Set<SecretType>): void {
   PROSE_ASSIGNMENT.lastIndex = 0;
   for (let match = PROSE_ASSIGNMENT.exec(value); match; match = PROSE_ASSIGNMENT.exec(value)) {
     const assigned = match[2] ?? "";
+    const range = match.indices?.[2];
     if (
+      range &&
       SENSITIVE_KEYS.has(normalizeKey(match[1] ?? "")) &&
       /[A-Za-z]/.test(assigned) &&
       /\d/.test(assigned) &&
       isLikelyCredentialValue(assigned)
     ) {
-      found.add("credential_assignment");
+      spans.push({ start: range[0], end: range[1], type: "credential_assignment" });
     }
   }
+
+  return spans;
+}
+
+function redactString(value: string, spans: SecretSpan[]): string {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  let out = "";
+  let cursor = 0;
+  for (const span of sorted) {
+    // overlapping detections (a key inside an assignment) collapse into the first
+    if (span.end <= cursor) continue;
+    out += value.slice(cursor, Math.max(cursor, span.start));
+    out += `[REDACTED:${span.type}]`;
+    cursor = span.end;
+  }
+  return out + value.slice(cursor);
 }
 
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function isSensitiveEntry(key: string | undefined, value: string): boolean {
+  return !!key && SENSITIVE_KEYS.has(normalizeKey(key)) && isLikelyCredentialValue(value);
 }
 
 function inspectValue(
@@ -161,10 +213,8 @@ function inspectValue(
   key?: string,
 ): void {
   if (typeof value === "string") {
-    inspectString(value, found);
-    if (key && SENSITIVE_KEYS.has(normalizeKey(key)) && isLikelyCredentialValue(value)) {
-      found.add("credential_assignment");
-    }
+    for (const span of findSecretSpans(value)) found.add(span.type);
+    if (isSensitiveEntry(key, value)) found.add("credential_assignment");
     return;
   }
 
@@ -182,6 +232,25 @@ function inspectValue(
   }
 }
 
+function redactValue(value: unknown, found: Set<SecretType>, key?: string): unknown {
+  if (typeof value === "string") {
+    if (isSensitiveEntry(key, value)) {
+      found.add("credential_assignment");
+      return "[REDACTED:credential_assignment]";
+    }
+    const spans = findSecretSpans(value);
+    if (spans.length === 0) return value;
+    for (const span of spans) found.add(span.type);
+    return redactString(value, spans);
+  }
+
+  if (Array.isArray(value)) return value.map((item) => redactValue(item, found));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([childKey, childValue]) => [childKey, redactValue(childValue, found, childKey)]),
+  );
+}
+
 export function scanRequestBody(body: unknown): SecretScanResult {
   let parsed = body;
   if (typeof body === "string") {
@@ -196,4 +265,25 @@ export function scanRequestBody(body: unknown): SecretScanResult {
   inspectValue(parsed, found, new WeakSet<object>());
   const secretTypes = [...found].sort((a, b) => a.localeCompare(b));
   return { blocked: secretTypes.length > 0, secretTypes };
+}
+
+export interface SecretRedactResult {
+  body: string;
+  secretTypes: SecretType[];
+}
+
+// Replaces every detected secret in a serialized request body with a
+// "[REDACTED:<type>]" marker, so the request can still go out without the
+// value. Blocking instead would wedge an agent session for good: the secret
+// sits in the conversation history and every later turn resends it.
+export function redactRequestBody(body: string): SecretRedactResult {
+  const found = new Set<SecretType>();
+  let redacted: string;
+  try {
+    redacted = JSON.stringify(redactValue(JSON.parse(body) as unknown, found));
+  } catch {
+    redacted = redactValue(body, found) as string;
+  }
+  const secretTypes = [...found].sort((a, b) => a.localeCompare(b));
+  return { body: secretTypes.length > 0 ? redacted : body, secretTypes };
 }

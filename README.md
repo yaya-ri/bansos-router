@@ -126,9 +126,11 @@ With `mode: "strict"`:
 - Only exact upstreams in `allowedUpstreams` receive requests (empty list blocks all).
 - Cross-provider failover disabled.
 - Sensitive values and raw upstream errors suppressed from logs.
-- **DLP blocks pasted credentials**: API keys, PATs, private keys, and
-  credential assignments pasted into a request are blocked with HTTP 422
-  before they leave for an external upstream (zen/kilo/llm7). Loopback
+- **DLP redacts pasted credentials**: API keys, PATs, private keys, and
+  credential assignments in a request are replaced with `[REDACTED:<type>]`
+  before it leaves for an external upstream (zen/kilo/llm7). The request
+  still goes through, so an agent that reads a secret (say, by grepping a
+  config file) keeps working instead of being wedged by its own history. Loopback
   (self-hosted) gateways are exempt, since their own keys are legitimately
   part of the request body.
 

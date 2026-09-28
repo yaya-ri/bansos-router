@@ -15,7 +15,7 @@ import {
   isUpstreamAllowed,
   type SecurityConfig,
 } from "../security/policy";
-import { scanRequestBody, type SecretType } from "../security/secret-guard";
+import { redactRequestBody, type SecretType } from "../security/secret-guard";
 import { ActivityStore, type ActivityKind } from "./activity";
 import type { ModelDef, Upstream } from "../upstreams/types";
 import { pickSmartDefaultModel } from "../upstreams/types";
@@ -1006,29 +1006,22 @@ async function runChatForward(
     const transformedBody = currentUpstream.transformRequestBody
       ? currentUpstream.transformRequestBody({ ...sanitizedBody, model: current.id }, current)
       : { ...sanitizedBody, model: current.id };
-    const outboundBody = JSON.stringify(
+    let outboundBody = JSON.stringify(
       responsesWire
         ? chatToResponsesBody(transformedBody, current.id)
         : transformedBody,
     );
 
     if (isExternalUpstream(currentUpstream)) {
-      const secretScan = scanRequestBody(outboundBody);
-      if (secretScan.blocked) {
-        log.warn("request blocked by secret guard", {
+      const redaction = redactRequestBody(outboundBody);
+      if (redaction.secretTypes.length > 0) {
+        log.warn("secrets redacted by secret guard", {
           model: current.id,
           upstream: currentUpstream.id,
-          status: 422,
-          durationMs: Date.now() - requestStartedAt,
-          dlpBlocked: true,
-          secretTypes: secretScan.secretTypes,
+          dlpRedacted: true,
+          secretTypes: redaction.secretTypes,
         });
-        return {
-          status: 422,
-          type: "security_policy_error",
-          message: "request blocked by secret guard",
-          secretTypes: secretScan.secretTypes,
-        };
+        outboundBody = redaction.body;
       }
     }
 
